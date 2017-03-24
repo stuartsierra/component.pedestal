@@ -20,7 +20,7 @@
   (vec (cons x (seq coll))))
 
 (defn- add-dependency-interceptor
-  "Adds an interceptor to the beginning of the interceptor chain in
+  "Adds an interceptor to the beginning of the interceptor chain
   which associates the dependencies of component into the Pedestal
   context map. Must be called before `io.pedestal.http/create-server`."
   [service-map component]
@@ -81,7 +81,7 @@
   beginning of each request. The keys in the context map will be the
   same as the keys in this component.
 
-  For example, if this component is wrapped in:
+  For example, if this component has dependencies declared like this:
 
    (component/using ... {:local-name :global-name})
 
