@@ -52,6 +52,8 @@ See [Default Interceptors] in the Pedestal documentation for details.
 [http/dev-interceptors]: http://pedestal.io/api/pedestal.service/io.pedestal.http.html#var-dev-interceptors
 [Default Interceptors]: http://pedestal.io/reference/default-interceptors
 
+Your service map should also contain `::http/join? false`.
+
 Your service map should be created in a function that takes the
 Pedestal **component** (provided by this library) as an argument and
 returns the service map.
