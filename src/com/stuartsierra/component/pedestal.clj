@@ -1,78 +1,111 @@
 (ns com.stuartsierra.component.pedestal
-  "Connection between the Component framework and the Pedestal web
-  application server."
+  "Component wrapper for the Pedestal web application server. Injects
+  component dependencies into Pedestal context."
   (:require [com.stuartsierra.component :as component]
             [io.pedestal.http :as http]
-            [io.pedestal.interceptor :refer [interceptor interceptor-name]]))
+            [io.pedestal.interceptor :refer [interceptor interceptor-name]]
+            [io.pedestal.log :as pedestal.log]))
 
-(defn insert-context-interceptor
-  "Returns an interceptor which associates key with value in the
-  Pedestal context map."
-  [key value]
+(defn- merge-context-interceptor
+  "Returns an interceptor which merges a map into the Pedestal context
+  map."
+  [m]
   (interceptor
-   {:name ::insert-context
-    :enter (fn [context] (assoc context key value))}))
+   {:name ::merge-context
+    :enter (fn [context] (merge context m))}))
 
-(defn add-component-interceptor
-  "Adds an interceptor to the pedestal-config map which associates the
-  pedestal-component into the Pedestal context map. Must be called
-  before io.pedestal.http/create-server."
-  [pedestal-config pedestal-component]
-  (update pedestal-config
-          ::http/interceptors
-          conj
-          (insert-context-interceptor
-           ::pedestal-component
-           pedestal-component)))
+(defn- prependv
+  "Returns a vector of x prepended to the elements of collection."
+  [coll x]
+  (vec (cons x (seq coll))))
 
-(defrecord Pedestal [pedestal-config-fn pedestal-server]
+(defn- add-dependency-interceptor
+  "Adds an interceptor to the beginning of the interceptor chain in
+  which associates the dependencies of component into the Pedestal
+  context map. Must be called before `io.pedestal.http/create-server`."
+  [service-map component]
+  (let [deps (reduce (fn [m k]
+                       (assoc m k (get component k)))
+                     {}
+                     (keys (component/dependencies component)))]
+    (update service-map
+            ::http/interceptors
+            prependv
+            (merge-context-interceptor deps))))
+
+(defrecord Pedestal []
   component/Lifecycle
   (start [this]
-    (if pedestal-server
+    (if (::service this)
       this
-      (assoc this :pedestal-server
-             (-> (pedestal-config-fn)
-                 (add-component-interceptor this)
-                 (http/create-server (constantly nil))  ; no-op init-fn
-                 http/start))))
+      (let [{:keys [::service-map-fn ::start-service-fn]} this]
+        (assoc this ::service
+               (-> (service-map-fn this)
+                   (add-dependency-interceptor this)
+                   start-service-fn)))))
   (stop [this]
-    (when pedestal-server
-      (http/stop pedestal-server))
-    (assoc this :pedestal-server nil)))
+    (when-let [server (::service this)]
+      (try (http/stop server)
+           (catch Throwable t
+             (pedestal.log/warn
+              :msg "Exception stopping Pedestal server"
+              :exception t))))))
 
-(defn- get-pedestal
-  [context]
-  (let [pedestal (get context ::pedestal-component ::not-found)]
-    (when (nil? pedestal)
-      (throw (ex-info (str "Pedestal component was nil in context map; "
-                           "component.pedestal is not configured correctly")
-                      {:reason ::nil-pedestal
-                       :context context})))
-    (when (= ::not-found pedestal)
-      (throw (ex-info (str "Pedestal component was missing from context map; "
-                           "component.pedestal is not configured correctly")
-                      {:reason ::missing-pedestal
-                       :context context})))
-    pedestal))
+(defn get-service-fn
+  "Returns the Pedestal interceptor service function to use with
+  `io.pedestal.test/response-for`."
+  [component]
+  (get-in component [::service ::http/service-fn]))
 
-(defn context-component
-  "Returns the component at key from the Pedestal context map. key
-  must have been a declared dependency of the Pedestal server
-  component."
-  [context key]
-  (let [component (get (get-pedestal context) key ::not-found)]
-    (when (nil? component)
-      (throw (ex-info (str "Component " key " was nil in Pedestal dependencies; "
-                           "maybe it returned nil from start or stop")
-                      {:reason ::nil-component
-                       :dependency-key key
-                       :context context})))
-    (when (= ::not-found component)
-      (throw (ex-info (str "Missing component " key " from Pedestal dependencies")
+(defn pedestal-server
+  "Returns a new instance of the Pedestal server component.
+
+  On Lifecycle start, this component calls `service-map-fn` with
+  itself as an argument. `service-map-fn` must return a Pedestal
+  service configuration map (see Pedestal documentation).
+
+  The service configuration should include
+  `:io.pedestal.http/join? false`.
+
+  If you want the default interceptors, you must call
+  `io.pedestal.http/default-interceptors` in `service-map-fn`.
+
+  If you want the development interceptors, you must call
+  `io.pedestal.http/dev-interceptors` in `service-map-fn`.
+
+  This component calls `io.pedestal.http/create-server` and
+  `io.pedestal.http/start` for you.
+
+  This component's dependencies (as by `component/using` or
+  `system-using`) will be merged into the Pedestal context map at the
+  beginning of each request. The keys in the context map will be the
+  same as the keys in this component.
+
+  For example, if this component is wrapped in:
+
+   (component/using ... {:local-name :global-name})
+
+  Then the component found in the system at :global-name will appear
+  in the Pedestal context map as :local-name."
+  [service-map-fn]
+  (map->Pedestal {::service-map-fn service-map-fn
+                  ::start-service-fn (comp http/start http/create-server)}))
+
+(defn pedestal-servlet
+  "Like `pedestal-server` but only constructs a Servlet without
+  initializing a container or starting an HTTP server. Useful for
+  testing: see `get-service-fn`."
+  ([service-map-fn]
+   (map->Pedestal {::service-map-fn service-map-fn
+                   ::start-service-fn http/create-servlet})))
+
+(defn- get-component [context key]
+  (or (get context key)
+      (throw (ex-info (str "Missing (or nil) component " (pr-str key)
+                           " from Pedestal context")
                       {:reason ::missing-dependency
                        :dependency-key key
-                       :context context})))
-    component))
+                       :context context}))))
 
 (defn component-handler
   "Returns a Pedestal interceptor which extracts the component named
@@ -83,51 +116,13 @@
   request map. f should return a Ring-style response map.
 
   You can use this to replace Ring-style handler functions with
-  functions that take both a component and a request."
+  functions that take both a component and a request.
+
+  Optional first argument `name` is the Pedestal interceptor `:name`."
   ([key f] (component-handler nil key f))
   ([name key f]
    (interceptor
     {:name (interceptor-name name)
      :enter (fn [context]
-              (let [c (context-component context key)]
+              (let [c (get-component context key)]
                 (assoc context :response (f c (:request context)))))})))
-
-(defn using-component
-  "Returns an interceptor which associates the component named key
-  into the Ring-style request map as :component. The key must have
-  been declared a dependency of the Pedestal server component.
-
-  You can add this interceptor to your Pedestal routes to make the
-  component available to your Ring-style handler functions, which can
-  get :component from the request map."
-  [key]
-  (interceptor
-   {:name ::using-component
-    :enter (fn [context]
-             (assoc-in context [:request ::component]
-                       (get-component context key)))}))
-
-(defn use-component
-  "Returns the component added to the request map by
-  'using-component'."
-  [request]
-  (::component request))
-
-(defn pedestal
-  "Returns a new instance of the Pedestal server component.
-
-  pedestal-config-fn is a no-argument function which returns the
-  Pedestal server configuration map, which will be passed to
-  io.pedestal.http/create-server. If you want the default
-  interceptors, you must call io.pedestal.http/default-interceptors
-  in pedestal-config-fn.
-
-  The Pedestal component should have dependencies (as by
-  com.stuartsierra.component/using or system-using) on all components
-  needed by your web application. These dependencies will be available
-  in the Pedestal context map via 'context-component'.
-
-  You can make components available to your handler functions with
-  'using-component' or 'component-handler'."
-  ([pedestal-config-fn]
-   (->Pedestal pedestal-config-fn nil)))
